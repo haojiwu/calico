@@ -222,7 +222,11 @@ func (m *routeManager) updateParentIfaceAddr(addr string) {
 	m.parentDeviceLock.Lock()
 	defer m.parentDeviceLock.Unlock()
 	m.parentDeviceAddr = addr
-	m.tunnelChangedC <- struct{}{}
+	select {
+	case m.tunnelChangedC <- struct{}{}:
+	default:
+		// Channel already has a pending notification, no need to send another.
+	}
 }
 
 func (m *routeManager) parentIfaceAddr() string {
@@ -462,7 +466,7 @@ func (m *routeManager) detectParentIface() (netlink.Link, error) {
 	return nil, fmt.Errorf("Unable to find parent interface with address %s", parentAddr)
 }
 
-// KeepDeviceInSync runs in a loop and checks that the device is still correctly configured, and updates it if necessary.
+// keepDeviceInSync runs in a loop and checks that the device is still correctly configured, and updates it if necessary.
 func (m *routeManager) keepDeviceInSync(
 	ctx context.Context,
 	mtu int,
@@ -480,6 +484,12 @@ func (m *routeManager) keepDeviceInSync(
 	logNextSuccess := true
 	parentIface := ""
 
+	// Cache for the parent device lookup to avoid expensive netlink
+	// syscalls (LinkList + AddrList per link) on every iteration.
+	var cachedParentDevice netlink.Link
+	var cachedParentAddr string
+	parentDeviceDirty := true
+
 	sleepMonitoringChans := func(maxDuration time.Duration) {
 		timer := time.NewTimer(maxDuration)
 		defer timer.Stop()
@@ -489,24 +499,40 @@ func (m *routeManager) keepDeviceInSync(
 			logrus.Debug("Sleep returning early: context finished.")
 		case <-m.tunnelChangedC:
 			logrus.Debug("Sleep returning early: tunnel changed.")
+			// Parent address may have changed, invalidate cache.
+			parentDeviceDirty = true
 		}
 	}
 
 	for ctx.Err() == nil {
-		if m.parentIfaceAddr() == "" {
+		currentAddr := m.parentIfaceAddr()
+		if currentAddr == "" {
 			m.logCtx.Debug("Missing local information, retrying...")
 			sleepMonitoringChans(10 * time.Second)
 			continue
 		}
 
-		parentDevice, err := m.detectParentIface()
-		if err != nil {
-			m.logCtx.WithError(err).Warn("Failed to find parent device, retrying...")
-			sleepMonitoringChans(1 * time.Second)
-			continue
+		// Invalidate cache if the parent address changed.
+		if currentAddr != cachedParentAddr {
+			parentDeviceDirty = true
 		}
 
-		link, addr, err := getDevice(parentDevice)
+		// Only perform the expensive detectParentIface() when needed.
+		if parentDeviceDirty {
+			parentDevice, err := m.detectParentIface()
+			if err != nil {
+				m.logCtx.WithError(err).Warn("Failed to find parent device, retrying...")
+				cachedParentDevice = nil
+				cachedParentAddr = ""
+				sleepMonitoringChans(1 * time.Second)
+				continue
+			}
+			cachedParentDevice = parentDevice
+			cachedParentAddr = currentAddr
+			parentDeviceDirty = false
+		}
+
+		link, addr, err := getDevice(cachedParentDevice)
 		if err != nil {
 			m.logCtx.WithError(err).Warn("Failed to get tunnel device, retrying...")
 			sleepMonitoringChans(1 * time.Second)
@@ -524,7 +550,7 @@ func (m *routeManager) keepDeviceInSync(
 			}
 		}
 
-		newParentIface := parentDevice.Attrs().Name
+		newParentIface := cachedParentDevice.Attrs().Name
 		if newParentIface != parentIface {
 			// Send a message back to the main loop to tell it to update the
 			// routing tables.
@@ -534,6 +560,7 @@ func (m *routeManager) keepDeviceInSync(
 				parentIface = newParentIface
 			case <-m.tunnelChangedC:
 				m.logCtx.Info("Tunnel changed; restarting configuration.")
+				parentDeviceDirty = true
 				continue
 			case <-ctx.Done():
 				continue
