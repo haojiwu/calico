@@ -222,7 +222,11 @@ func (m *routeManager) updateParentIfaceAddr(addr string) {
 	m.parentDeviceLock.Lock()
 	defer m.parentDeviceLock.Unlock()
 	m.parentDeviceAddr = addr
-	m.tunnelChangedC <- struct{}{}
+	select {
+	case m.tunnelChangedC <- struct{}{}:
+	default:
+		// Channel already has a pending notification, no need to send another.
+	}
 }
 
 func (m *routeManager) parentIfaceAddr() string {
